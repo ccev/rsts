@@ -1,0 +1,12 @@
+/target
+/data/*
+rsts.toml
+pg_data
+flake.lock
+flake.nix
+GEMINI.md
+martin.yml
+.idea/*
+.envrc
+.direnv
+docker-compose.yml

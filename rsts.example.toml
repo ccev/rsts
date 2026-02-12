@@ -1,0 +1,13 @@
+# the url of your martin tileserver
+martin_url = "http://martin:3000"
+
+# number of worker threads for rendering. defaults to cpu core count if omitted.
+thread_count = 4
+
+# maximum size of the tile cache in gigabytes.
+cache_size_gb = 10
+
+[tile_sources]
+# external tile sources for static maps and the /tiles mirror endpoint
+# use {z}, {x}, {y} and {scale} placeholders
+# name = "url?x={x}&y={y}&z={z}&scale={scale}"

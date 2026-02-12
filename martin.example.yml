@@ -1,0 +1,26 @@
+# refer to https://maplibre.org/martin/config-file.html for all options
+
+listen_addresses: "0.0.0.0:3000"
+
+# can be enable-for-all or disable
+# make sure to not expose this in prod use
+web_ui: enable-for-all
+
+# exampple: /tiles
+route_prefix: null
+
+mbtiles:
+  paths:
+    - /data/mbtiles
+
+fonts:
+  paths:
+    - /data/fonts
+
+styles:
+  paths:
+    - /data/styles
+
+#sprites:
+#  paths:
+#    - /data/sprites/{style id}
