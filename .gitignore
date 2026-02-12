@@ -2,8 +2,7 @@
 /data/*
 rsts.toml
 pg_data
-flake.lock
-flake.nix
+.nix/
 GEMINI.md
 martin.yml
 .idea/*

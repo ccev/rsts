@@ -6,6 +6,7 @@ use axum::{
     middleware::{self, Next},
     http::Request,
 };
+use tower_http::catch_panic::CatchPanicLayer;
 use image::{ColorType, DynamicImage, ImageEncoder};
 use maplibre_native::ImageRendererBuilder;
 use std::collections::HashMap;
@@ -51,6 +52,22 @@ fn main() -> anyhow::Result<()> {
         .with_target(false)
         .compact()
         .init();
+
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_else(|| "unknown".to_string());
+        let payload = panic_info.payload();
+        let message = if let Some(s) = payload.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "unknown panic payload"
+        };
+        error!("PANIC at {}: {}", location, message);
+        // By not calling the default hook and just returning, 
+        // we prevent the default 'abort' behavior for the process 
+        // if the panic occurs in a spawned thread (like our blocking renderer).
+    }));
 
     let config = Config::load()?;
     let thread_count = config.thread_count.unwrap_or_else(|| num_cpus::get());
@@ -101,6 +118,7 @@ async fn async_main(config: Config) -> anyhow::Result<()> {
         .route("/multistaticmap/{template}", get(get_multi_static_map_template).post(post_multi_static_map_template))
         .route("/tiles/{id}/{z}/{x}/{y}", get(proxy_tile))
         .layer(middleware::from_fn(log_request_response))
+        .layer(CatchPanicLayer::new())
         .with_state(state);
 
     let addr = "0.0.0.0:3001";
@@ -142,16 +160,19 @@ async fn proxy_tile(
             let bytes = resp.bytes().await.unwrap_or_default();
             if status.is_success() {
                 let _ = state.tile_cache.insert(&cache_key, bytes.to_vec()).await;
+                (
+                    axum::http::StatusCode::OK,
+                    [("content-type", content_type)],
+                    bytes
+                ).into_response()
+            } else {
+                debug!("tile source {} returned error: {}", id, status);
+                (axum::http::StatusCode::NOT_FOUND, "tile not found").into_response()
             }
-            (
-                axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
-                [("content-type", content_type)],
-                bytes
-            ).into_response()
         },
         Err(e) => {
             error!("proxy error for {}: {}", id, e);
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "external tile source error").into_response()
+            (axum::http::StatusCode::NOT_FOUND, "tile source error").into_response()
         },
     }
 }
@@ -310,10 +331,21 @@ async fn generate_static_map_image(state: Arc<AppState>, params: &StaticMapReque
     }
     let params_clone = params.clone();
     let state_clone = state.clone();
-    let img = tokio::task::spawn_blocking(move || {
+    let img_res = tokio::task::spawn_blocking(move || {
         render_map_internal(&params_clone, marker_images, state_clone)
-    }).await??;
-    Ok(img)
+    }).await;
+
+    match img_res {
+        Ok(Ok(img)) => Ok(img),
+        Ok(Err(e)) => {
+            error!("render_map_internal error: {}", e);
+            Err(e)
+        },
+        Err(e) => {
+            error!("blocking task panicked or was cancelled: {}", e);
+            Err(anyhow::anyhow!("internal rendering panic"))
+        }
+    }
 }
 
 async fn generate_multi_map_image(state: Arc<AppState>, req: &MultiStaticMapRequest) -> anyhow::Result<DynamicImage> {
@@ -375,8 +407,11 @@ async fn generate_multi_map_image(state: Arc<AppState>, req: &MultiStaticMapRequ
 
 fn render_map_internal(params: &StaticMapRequest, marker_images: HashMap<String, DynamicImage>, state: Arc<AppState>) -> anyhow::Result<DynamicImage> {
     let scale = params.scale.unwrap_or(1);
+    let width = NonZeroU32::new(params.width).ok_or_else(|| anyhow::anyhow!("width must be greater than 0"))?;
+    let height = NonZeroU32::new(params.height).ok_or_else(|| anyhow::anyhow!("height must be greater than 0"))?;
+    
     let builder = ImageRendererBuilder::new()
-        .with_size(NonZeroU32::new(params.width).unwrap(), NonZeroU32::new(params.height).unwrap())
+        .with_size(width, height)
         .with_pixel_ratio(scale as f32);
     
     let mut renderer = builder.build_static_renderer();
@@ -419,18 +454,31 @@ fn render_map_internal(params: &StaticMapRequest, marker_images: HashMap<String,
     for (url, img) in &marker_images {
         let tmp = tempfile::Builder::new().suffix(".png").tempfile()?;
         img.save(tmp.path())?;
-        marker_url_map.insert(url.clone(), Url::from_file_path(tmp.path()).unwrap().to_string());
+        let path_url = Url::from_file_path(tmp.path())
+            .map_err(|_| anyhow::anyhow!("failed to create URL from temp file path"))?;
+        marker_url_map.insert(url.clone(), path_url.to_string());
         marker_temp_files.push(tmp);
     }
 
     inject_overlays_into_style(&mut style_json, params, &marker_images, &marker_url_map)?;
     let mut temp_file = tempfile::Builder::new().suffix(".json").tempfile()?;
     temp_file.write_all(serde_json::to_string(&style_json)?.as_bytes())?;
-    renderer.load_style_from_url(&Url::from_file_path(temp_file.path()).unwrap());
     
+    let style_url = Url::from_file_path(temp_file.path())
+        .map_err(|_| anyhow::anyhow!("failed to create URL from style temp file path"))?;
+
     debug!("rendering static map for {} at {},{}", params.style, params.latitude, params.longitude);
-    let render_result = renderer.render_static(params.latitude, params.longitude, params.zoom, params.bearing.unwrap_or(0.0), params.pitch.unwrap_or(0.0))?;
-    Ok(DynamicImage::ImageRgba8(render_result.as_image().clone()))
+
+    let render_result = std::panic::catch_unwind(move || {
+        renderer.load_style_from_url(&style_url);
+        renderer.render_static(params.latitude, params.longitude, params.zoom, params.bearing.unwrap_or(0.0), params.pitch.unwrap_or(0.0))
+    });
+
+    match render_result {
+        Ok(Ok(res)) => Ok(DynamicImage::ImageRgba8(res.as_image().clone())),
+        Ok(Err(e)) => Err(anyhow::anyhow!("MapLibre error: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("MapLibre C++ panic/abort during rendering")),
+    }
 }
 
 fn rewrite_urls_recursive(value: &mut serde_json::Value, martin_url: &str) {
