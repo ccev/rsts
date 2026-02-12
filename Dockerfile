@@ -1,5 +1,5 @@
 # Builder stage
-FROM rust:1.84-slim AS builder
+FROM rust:1.93-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     cmake \
     g++ \
     libvulkan-dev \
+    libcurl4-openssl-dev \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
