@@ -12,25 +12,30 @@ pub struct TemplateEngine {
 impl TemplateEngine {
 
     pub fn new(base_path: PathBuf) -> Result<Self> {
-
-        // Use a more robust glob pattern
+        // Ensure the directory exists
+        if !base_path.exists() {
+            std::fs::create_dir_all(&base_path)?;
+        }
 
         let pattern = format!("{}/**/*.json", base_path.to_string_lossy());
-
-        let mut tera = Tera::new(&pattern)?;
+        let mut tera = match Tera::new(&pattern) {
+            Ok(t) => t,
+            Err(e) => {
+                // If it's just "no templates found", initialize empty
+                if e.to_string().contains("no templates found") || e.to_string().contains("match any files") {
+                    Tera::default()
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
 
         tera.autoescape_on(vec![]); 
 
-        
-
         Ok(Self {
-
             tera: Mutex::new(tera),
-
             base_path,
-
         })
-
     }
 
 

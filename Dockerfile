@@ -1,8 +1,13 @@
 # Builder stage
-FROM rust:1.93-slim AS builder
+FROM ubuntu:24.04 AS builder
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
     pkg-config \
     libssl-dev \
     cmake \
@@ -12,6 +17,10 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Rust manually since we're using Ubuntu base
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 WORKDIR /app
 COPY . .
 
@@ -19,22 +28,28 @@ COPY . .
 RUN cargo build --release
 
 # Runner stage
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libvulkan1 \
     libssl3 \
+    libcurl4 \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy binary
 COPY --from=builder /app/target/release/rsts /app/rsts
+COPY rsts.example.toml /app/rsts.example.toml
 
 # Create data directories
-RUN mkdir -p data/templates data/cache data/styles
+RUN mkdir -p data/templates data/cache data/styles data/sprites data/mbtiles data/fonts
 
 # Expose port
 EXPOSE 3001

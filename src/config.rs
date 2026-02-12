@@ -12,7 +12,15 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let content = fs::read_to_string("rsts.toml")?;
+        let path = if std::path::Path::new("rsts.toml").exists() {
+            "rsts.toml"
+        } else if std::path::Path::new("rsts.example.toml").exists() {
+            "rsts.example.toml"
+        } else {
+            return Err(anyhow::anyhow!("Configuration file not found. Please create rsts.toml or provide rsts.example.toml."));
+        };
+
+        let content = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
     }
