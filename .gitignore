@@ -9,3 +9,5 @@ martin.yml
 .envrc
 .direnv
 docker-compose.yml
+spam.sh
+server.log

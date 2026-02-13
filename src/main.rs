@@ -10,12 +10,12 @@ use tower_http::catch_panic::CatchPanicLayer;
 use image::{ColorType, DynamicImage, ImageEncoder};
 use maplibre_native::ImageRendererBuilder;
 use std::collections::HashMap;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Write, Read};
 use std::num::NonZeroU32;
 use tokio::net::TcpListener;
 use url::Url;
 use std::sync::Arc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, error, debug};
 
@@ -40,14 +40,27 @@ impl From<ContextWrapper> for tera::Context {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct WorkerPayload {
+    request: StaticMapRequest,
+    style_json: serde_json::Value,
+    marker_data: HashMap<String, Vec<u8>>,
+}
+
 struct AppState {
     template_engine: TemplateEngine,
     config: Config,
     http_client: reqwest::Client,
     tile_cache: TileCache,
+    render_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 fn main() -> anyhow::Result<()> {
+    // Check for worker mode first
+    if std::env::args().any(|arg| arg == "--worker") {
+        return worker_main();
+    }
+
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()
@@ -64,9 +77,6 @@ fn main() -> anyhow::Result<()> {
             "unknown panic payload"
         };
         error!("PANIC at {}: {}", location, message);
-        // By not calling the default hook and just returning, 
-        // we prevent the default 'abort' behavior for the process 
-        // if the panic occurs in a spawned thread (like our blocking renderer).
     }));
 
     let config = Config::load()?;
@@ -80,6 +90,34 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     runtime.block_on(async_main(config))
+}
+
+fn worker_main() -> anyhow::Result<()> {
+    let mut input_bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut input_bytes)?;
+    let payload: WorkerPayload = serde_json::from_slice(&input_bytes)?;
+    
+    let mut marker_images = HashMap::new();
+    for (url, data) in payload.marker_data {
+        let img = image::load_from_memory(&data)?;
+        marker_images.insert(url, img);
+    }
+
+    match render_map_internal(&payload.request, marker_images, payload.style_json) {
+        Ok(img) => {
+            let mut cursor = Cursor::new(Vec::new());
+            let (w, h) = (img.width(), img.height());
+            let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+            let img_rgba = img.to_rgba8();
+            encoder.write_image(&img_rgba, w, h, ColorType::Rgba8.into())?;
+            std::io::stdout().write_all(&cursor.into_inner())?;
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("Worker error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn log_request_response(
@@ -98,17 +136,23 @@ async fn async_main(config: Config) -> anyhow::Result<()> {
     let template_engine = TemplateEngine::new("data/templates".into())?;
     let http_client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let cache_dir = std::path::Path::new("data/cache").to_path_buf();
     let max_cache_gb = config.cache_size_gb.unwrap_or(10);
     let tile_cache = TileCache::new(cache_dir, max_cache_gb).await?;
 
+    // Allow concurrency up to CPU count since we are using isolated processes
+    let concurrency_limit = num_cpus::get().max(4); 
+    let render_semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency_limit));
+
     let state = Arc::new(AppState { 
         template_engine,
         config,
         http_client,
         tile_cache,
+        render_semaphore,
     });
 
     let app = Router::new()
@@ -318,34 +362,103 @@ async fn render_and_generate_multi(state: Arc<AppState>, template: &str, context
 // --- Core Logic ---
 
 async fn generate_static_map_image(state: Arc<AppState>, params: &StaticMapRequest) -> anyhow::Result<DynamicImage> {
-    let mut marker_images = HashMap::new();
+    let mut marker_data = HashMap::new();
     if let Some(markers) = &params.markers {
         for marker in markers {
-            if !marker_images.contains_key(&marker.url) {
-                match fetch_image(&marker.url).await {
-                    Ok(img) => { marker_images.insert(marker.url.clone(), img); },
+            if !marker_data.contains_key(&marker.url) {
+                match fetch_image(&state.http_client, &marker.url).await {
+                    Ok(img) => {
+                        let mut bytes = Vec::new();
+                        let mut cursor = Cursor::new(&mut bytes);
+                        img.write_to(&mut cursor, image::ImageFormat::Png)?;
+                        marker_data.insert(marker.url.clone(), bytes);
+                    },
                     Err(e) => error!("failed to fetch marker {}: {}", marker.url, e),
                 }
             }
         }
     }
-    let params_clone = params.clone();
-    let state_clone = state.clone();
-    let img_res = tokio::task::spawn_blocking(move || {
-        render_map_internal(&params_clone, marker_images, state_clone)
-    }).await;
 
-    match img_res {
-        Ok(Ok(img)) => Ok(img),
-        Ok(Err(e)) => {
-            error!("render_map_internal error: {}", e);
-            Err(e)
-        },
-        Err(e) => {
-            error!("blocking task panicked or was cancelled: {}", e);
-            Err(anyhow::anyhow!("internal rendering panic"))
+    let scale = params.scale.unwrap_or(1);
+    let style_json = if state.config.tile_sources.contains_key(&params.style) {
+        json!({
+            "version": 8,
+            "sources": {
+                "raster-tiles": {
+                    "type": "raster",
+                    "tiles": [ format!("http://localhost:3001/tiles/{}/{{z}}/{{x}}/{{y}}?scale={}", params.style, scale) ],
+                    "tileSize": 256
+                }
+            },
+            "layers": [{
+                "id": "simple-tiles",
+                "type": "raster",
+                "source": "raster-tiles",
+                "minzoom": 0,
+                "maxzoom": 22
+            }]
+        })
+    } else {
+        let style_url = format!("{}/style/{}.json", state.config.martin_url, params.style);
+        let resp = state.http_client.get(&style_url).send().await?;
+        
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("failed to fetch style from {}: {}", style_url, resp.status()));
         }
+        let mut sj: serde_json::Value = resp.json().await?;
+        rewrite_urls_recursive(&mut sj, &state.config.martin_url);
+        sj
+    };
+
+    // Acquire permit from semaphore (high concurrency allowed now)
+    let _permit = state.render_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("semaphore error: {}", e))?;
+
+    let payload = WorkerPayload {
+        request: params.clone(),
+        style_json,
+        marker_data,
+    };
+
+    let exe_path = std::env::current_exe()?;
+    let mut child = tokio::process::Command::new(exe_path)
+        .arg("--worker")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("failed to open child stdin"))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("failed to open child stdout"))?;
+
+    let payload_json = serde_json::to_vec(&payload)?;
+    
+    use tokio::io::{AsyncWriteExt, AsyncReadExt};
+
+    stdin.write_all(&payload_json).await?;
+    drop(stdin); // Close stdin to signal EOF to child
+
+    let mut output_bytes = Vec::new();
+    stdout.read_to_end(&mut output_bytes).await?;
+    
+    let status = child.wait().await?;
+
+    if !status.success() {
+        // Try to read stderr
+        if let Some(mut stderr) = child.stderr.take() {
+            let mut err_msg = String::new();
+            let _ = stderr.read_to_string(&mut err_msg).await;
+            error!("Worker process failed: {}", err_msg);
+            return Err(anyhow::anyhow!("Worker process failed: {}", err_msg));
+        }
+        return Err(anyhow::anyhow!("Worker process failed with status {}", status));
     }
+
+    if output_bytes.is_empty() {
+        return Err(anyhow::anyhow!("Worker returned empty response"));
+    }
+
+    let img = image::load_from_memory(&output_bytes)?;
+    Ok(img)
 }
 
 async fn generate_multi_map_image(state: Arc<AppState>, req: &MultiStaticMapRequest) -> anyhow::Result<DynamicImage> {
@@ -405,7 +518,7 @@ async fn generate_multi_map_image(state: Arc<AppState>, req: &MultiStaticMapRequ
     Ok(final_img)
 }
 
-fn render_map_internal(params: &StaticMapRequest, marker_images: HashMap<String, DynamicImage>, state: Arc<AppState>) -> anyhow::Result<DynamicImage> {
+fn render_map_internal(params: &StaticMapRequest, marker_images: HashMap<String, DynamicImage>, mut style_json: serde_json::Value) -> anyhow::Result<DynamicImage> {
     let scale = params.scale.unwrap_or(1);
     let width = NonZeroU32::new(params.width).ok_or_else(|| anyhow::anyhow!("width must be greater than 0"))?;
     let height = NonZeroU32::new(params.height).ok_or_else(|| anyhow::anyhow!("height must be greater than 0"))?;
@@ -415,39 +528,6 @@ fn render_map_internal(params: &StaticMapRequest, marker_images: HashMap<String,
         .with_pixel_ratio(scale as f32);
     
     let mut renderer = builder.build_static_renderer();
-    
-    let mut style_json = if state.config.tile_sources.contains_key(&params.style) {
-        json!({
-            "version": 8,
-            "sources": {
-                "raster-tiles": {
-                    "type": "raster",
-                    "tiles": [ format!("http://localhost:3001/tiles/{}/{{z}}/{{x}}/{{y}}?scale={}", params.style, scale) ],
-                    "tileSize": 256
-                }
-            },
-            "layers": [{
-                "id": "simple-tiles",
-                "type": "raster",
-                "source": "raster-tiles",
-                "minzoom": 0,
-                "maxzoom": 22
-            }]
-        })
-    } else {
-        let style_url = format!("{}/style/{}.json", state.config.martin_url, params.style);
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()?;
-            
-        let resp = client.get(&style_url).send()?;
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!("failed to fetch style from {}: {}", style_url, resp.status()));
-        }
-        let mut sj: serde_json::Value = resp.json()?;
-        rewrite_urls_recursive(&mut sj, &state.config.martin_url);
-        sj
-    };
     
     let mut marker_temp_files = Vec::new();
     let mut marker_url_map = HashMap::new();

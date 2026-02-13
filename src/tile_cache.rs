@@ -1,6 +1,6 @@
-use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteJournalMode}};
 use std::path::PathBuf;
-use std::fs;
+use tokio::fs;
 use anyhow::Result;
 use chrono::Utc;
 use tracing::{info, debug};
@@ -14,15 +14,20 @@ pub struct TileCache {
 impl TileCache {
     pub async fn new(cache_dir: PathBuf, max_size_gb: u64) -> Result<Self> {
         if !cache_dir.exists() {
-            fs::create_dir_all(&cache_dir)?;
+            fs::create_dir_all(&cache_dir).await?;
         }
 
         let db_path = cache_dir.join("cache_metadata.db");
         let opts = SqliteConnectOptions::new()
             .filename(&db_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
 
-        let pool = SqlitePool::connect_with(opts).await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(50)
+            .connect_with(opts)
+            .await?;
 
         // Initialize table
         sqlx::query(
@@ -50,21 +55,10 @@ impl TileCache {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((rel_path, hit_count)) = row {
+        if let Some((rel_path, _hit_count)) = row {
             let full_path = self.cache_dir.join(rel_path);
             if full_path.exists() {
-                let bytes = fs::read(full_path)?;
-                
-                // Update hit count and last access
-                sqlx::query(
-                    "UPDATE tiles SET hit_count = ?, last_access_at = ? WHERE key = ?"
-                )
-                .bind(hit_count + 1)
-                .bind(Utc::now().timestamp())
-                .bind(key)
-                .execute(&self.pool)
-                .await?;
-
+                let bytes = fs::read(full_path).await?;
                 debug!("cache hit: {}", key);
                 return Ok(Some(bytes));
             } else {
@@ -82,7 +76,7 @@ impl TileCache {
         let file_name = format!("{}.bin", key.replace('/', "_").replace(':', "_"));
         let full_path = self.cache_dir.join(&file_name);
 
-        fs::write(&full_path, &data)?;
+        fs::write(&full_path, &data).await?;
 
         sqlx::query(
             "INSERT OR REPLACE INTO tiles (key, file_path, size_bytes, last_access_at) 
@@ -119,7 +113,7 @@ impl TileCache {
             for (key, rel_path, _size) in to_evict {
                 let full_path = self.cache_dir.join(rel_path);
                 if full_path.exists() {
-                    let _ = fs::remove_file(full_path);
+                    let _ = fs::remove_file(full_path).await;
                 }
                 sqlx::query("DELETE FROM tiles WHERE key = ?").bind(&key).execute(&self.pool).await?;
                 debug!("evicted: {}", key);
