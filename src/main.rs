@@ -6,7 +6,10 @@ use axum::{
     middleware::{self, Next},
     http::Request,
 };
-use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::{
+    catch_panic::CatchPanicLayer,
+    cors::CorsLayer,
+};
 use image::{ColorType, DynamicImage, ImageEncoder};
 use maplibre_native::ImageRendererBuilder;
 use std::collections::HashMap;
@@ -126,9 +129,11 @@ async fn log_request_response(
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
+    let start = std::time::Instant::now();
     info!("incoming request: {} {}", method, path);
     let response = next.run(req).await;
-    info!("request result: {} for {} {}", response.status(), method, path);
+    let duration = start.elapsed();
+    info!("request result: {} for {} {} (took {:?})", response.status(), method, path, duration);
     response
 }
 
@@ -163,6 +168,7 @@ async fn async_main(config: Config) -> anyhow::Result<()> {
         .route("/tiles/{id}/{z}/{x}/{y}", get(proxy_tile))
         .layer(middleware::from_fn(log_request_response))
         .layer(CatchPanicLayer::new())
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = "0.0.0.0:3001";
@@ -366,11 +372,23 @@ async fn generate_static_map_image(state: Arc<AppState>, params: &StaticMapReque
     if let Some(markers) = &params.markers {
         for marker in markers {
             if !marker_data.contains_key(&marker.url) {
+                let cache_key = format!("marker:{}", marker.url);
+                if let Ok(Some(data)) = state.tile_cache.get(&cache_key).await {
+                    marker_data.insert(marker.url.clone(), data);
+                    continue;
+                }
+
                 match fetch_image(&state.http_client, &marker.url).await {
                     Ok(img) => {
                         let mut bytes = Vec::new();
                         let mut cursor = Cursor::new(&mut bytes);
-                        img.write_to(&mut cursor, image::ImageFormat::Png)?;
+                        // Encode to PNG to ensure consistent format in cache and for worker
+                        if let Err(e) = img.write_to(&mut cursor, image::ImageFormat::Png) {
+                            error!("failed to encode marker {}: {}", marker.url, e);
+                            continue;
+                        }
+                        
+                        let _ = state.tile_cache.insert(&cache_key, bytes.clone()).await;
                         marker_data.insert(marker.url.clone(), bytes);
                     },
                     Err(e) => error!("failed to fetch marker {}: {}", marker.url, e),
