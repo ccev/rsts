@@ -185,6 +185,7 @@ async fn proxy_tile(
     Path((id, z, x, y)): Path<(String, u32, u32, u32)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let start = std::time::Instant::now();
     let source_url_template = match state.config.tile_sources.get(&id) {
         Some(url) => url,
         None => return (axum::http::StatusCode::NOT_FOUND, "tile source not found").into_response(),
@@ -194,6 +195,8 @@ async fn proxy_tile(
     let cache_key = format!("{}:{}/{}/{}/{}", id, z, x, y, scale);
 
     if let Ok(Some(bytes)) = state.tile_cache.get(&cache_key).await {
+        let duration = start.elapsed();
+        debug!("served tile {} from cache in {:?}", cache_key, duration);
         return ([("content-type", "image/png")], bytes).into_response();
     }
 
@@ -210,6 +213,8 @@ async fn proxy_tile(
             let bytes = resp.bytes().await.unwrap_or_default();
             if status.is_success() {
                 let _ = state.tile_cache.insert(&cache_key, bytes.to_vec()).await;
+                let duration = start.elapsed();
+                info!("fetched and served tile {} in {:?}", cache_key, duration);
                 (
                     axum::http::StatusCode::OK,
                     [("content-type", content_type)],
@@ -368,6 +373,7 @@ async fn render_and_generate_multi(state: Arc<AppState>, template: &str, context
 // --- Core Logic ---
 
 async fn generate_static_map_image(state: Arc<AppState>, params: &StaticMapRequest) -> anyhow::Result<DynamicImage> {
+    let start = std::time::Instant::now();
     let mut marker_data = HashMap::new();
     if let Some(markers) = &params.markers {
         for marker in markers {
@@ -476,10 +482,12 @@ async fn generate_static_map_image(state: Arc<AppState>, params: &StaticMapReque
     }
 
     let img = image::load_from_memory(&output_bytes)?;
+    info!("generated static map for {} in {:?}", params.style, start.elapsed());
     Ok(img)
 }
 
 async fn generate_multi_map_image(state: Arc<AppState>, req: &MultiStaticMapRequest) -> anyhow::Result<DynamicImage> {
+    let start = std::time::Instant::now();
     let mut composed_rows = Vec::new();
     for row in &req.grid {
         let mut row_img: Option<DynamicImage> = None;
@@ -533,6 +541,7 @@ async fn generate_multi_map_image(state: Arc<AppState>, req: &MultiStaticMapRequ
              _ => {}
          }
     }
+    info!("generated multi-map in {:?}", start.elapsed());
     Ok(final_img)
 }
 
